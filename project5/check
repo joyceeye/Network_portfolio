@@ -1,0 +1,544 @@
+#!/usr/bin/env python3
+
+import argparse
+import socket
+import ssl
+import re
+from html.parser import HTMLParser
+from collections import deque
+
+DEFAULT_SERVER = "fakebook.khoury.northeastern.edu"
+DEFAULT_PORT = 443
+
+class HTMLLinkParser(HTMLParser):
+    """Parser for extracting links and secret flags from HTML content"""
+    
+    def __init__(self):
+        super().__init__()
+        self.links = []
+        self.flags = []
+        
+    def handle_starttag(self, tag, attrs):
+        # Extract links from anchor tags
+        if tag == 'a':
+            for attr in attrs:
+                if attr[0] == 'href':
+                    self.links.append(attr[1])
+    
+    def handle_data(self, data):
+        # We're not searching for flags in the data directly
+        # Flags will be found in the handle_starttag with the secret_flag class
+        pass
+        
+    def handle_startendtag(self, tag, attrs):
+        # Some tags might be self-closing, handle them similarly
+        self.handle_starttag(tag, attrs)
+        
+    def error(self, message):
+        pass
+
+class Crawler:
+    def __init__(self, args):
+        self.server = args.server
+        self.port = args.port
+        self.username = args.username
+        self.password = args.password
+        
+        # Store cookies for maintaining session
+        self.cookies = {}
+        
+        # Store visited URLs to avoid loops
+        self.visited = set()
+        
+        # URLs to be crawled (frontier)
+        self.frontier = deque()
+        
+        # Collection of found flags
+        self.flags = []
+        
+        # CSRF token for login
+        self.csrf_token = None
+        
+        # Base URL for the site
+        self.base_url = f"https://{self.server}:{self.port}"
+        
+        # Login URL
+        self.login_url = f"{self.base_url}/accounts/login/?next=/fakebook/"
+        
+        # Domain to check against when filtering URLs
+        self.domain = self.server
+        
+    # URL parsing utility functions to replace urllib.parse
+    def parse_url(self, url):
+        """Parse a URL into components (scheme, netloc, path, params, query, fragment)"""
+        class ParseResult:
+            def __init__(self, scheme='', netloc='', path='', params='', query='', fragment=''):
+                self.scheme = scheme
+                self.netloc = netloc
+                self.path = path
+                self.params = params
+                self.query = query
+                self.fragment = fragment
+                
+        # Basic URL parsing without using urllib.parse
+        if '://' in url:
+            scheme, rest = url.split('://', 1)
+        else:
+            scheme, rest = '', url
+            
+        if '/' in rest:
+            netloc, path_part = rest.split('/', 1)
+            path = '/' + path_part
+        else:
+            netloc, path = rest, ''
+            
+        # Handle query and fragment
+        if '#' in path:
+            path, fragment = path.split('#', 1)
+        else:
+            fragment = ''
+            
+        if '?' in path:
+            path, query = path.split('?', 1)
+        else:
+            query = ''
+            
+        # Handle params
+        if ';' in path:
+            path, params = path.split(';', 1)
+        else:
+            params = ''
+            
+        return ParseResult(scheme, netloc, path, params, query, fragment)
+    
+    def urljoin(self, base, url):
+        """Join a base URL and a possibly relative URL to form an absolute URL"""
+        if not url:
+            return base
+            
+        # If the URL is already absolute, return it
+        if '://' in url:
+            return url
+            
+        # Get the base components
+        base_parts = self.parse_url(base)
+        
+        # Handle absolute paths
+        if url.startswith('/'):
+            if base_parts.netloc:
+                return f"{base_parts.scheme}://{base_parts.netloc}{url}"
+            else:
+                return url
+        
+        # Handle relative paths
+        base_path = base_parts.path
+        if not base_path.endswith('/'):
+            # Remove the last path component
+            if '/' in base_path:
+                base_path = base_path.rsplit('/', 1)[0] + '/'
+            else:
+                base_path = '/'
+                
+        # Join the paths
+        joined_path = base_path + url
+        
+        # Handle .. and . in the path
+        path_parts = []
+        for part in joined_path.split('/'):
+            if part == '..':
+                if path_parts:
+                    path_parts.pop()
+            elif part != '.' and part:
+                path_parts.append(part)
+                
+        # Reconstruct the path
+        clean_path = '/' + '/'.join(path_parts)
+        
+        if base_parts.netloc:
+            return f"{base_parts.scheme}://{base_parts.netloc}{clean_path}"
+        else:
+            return clean_path
+            
+    def quote(self, s):
+        """URL encode a string"""
+        safe = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-~"
+        result = ""
+        for c in s:
+            if c in safe:
+                result += c
+            else:
+                result += f"%{ord(c):02X}"
+        return result
+        
+    def create_connection(self):
+        """Create a TLS-wrapped socket connection to the server"""
+        # Create a standard socket
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        
+        # Wrap the socket with TLS/SSL
+        context = ssl.create_default_context()
+        wrapped_socket = context.wrap_socket(sock, server_hostname=self.server)
+        
+        # Connect to the server
+        wrapped_socket.connect((self.server, self.port))
+        
+        return wrapped_socket
+    
+    def send_request(self, method, path, headers=None, body=None, max_retries=5):
+        """Send HTTP request and return response"""
+        if headers is None:
+            headers = {}
+            
+        # Add required HTTP/1.1 headers
+        if 'Host' not in headers:
+            headers['Host'] = self.server
+            
+        # Add cookies if we have any
+        if self.cookies and 'Cookie' not in headers:
+            cookie_str = '; '.join([f"{k}={v}" for k, v in self.cookies.items()])
+            headers['Cookie'] = cookie_str
+            
+        # Construct the request
+        request = f"{method} {path} HTTP/1.1\r\n"
+        
+        # Add all headers
+        for key, value in headers.items():
+            request += f"{key}: {value}\r\n"
+            
+        # Add content length if we have a body
+        if body:
+            request += f"Content-Length: {len(body)}\r\n"
+            
+        # End headers
+        request += "\r\n"
+        
+        # Add body if present
+        if body:
+            request += body
+            
+        # For logging/debugging
+        # print(f"Request to {self.server}:{self.port}")
+        # print(request)
+        
+        retries = 0
+        while retries < max_retries:
+            try:
+                # Create connection and send request
+                mysocket = self.create_connection()
+                mysocket.send(request.encode('utf-8'))
+                
+                # Read response
+                response = b""
+                data = mysocket.recv(4096)
+                
+                # Keep reading until we get all data
+                while data:
+                    response += data
+                    try:
+                        data = mysocket.recv(4096)
+                        if not data:
+                            break
+                    except socket.timeout:
+                        break
+                
+                # Close the socket
+                mysocket.close()
+                
+                # Decode the response
+                decoded_resp = response.decode('utf-8', errors='ignore')
+                
+                # Parse the response
+                status_code, headers, body = self.parse_response(decoded_resp)
+                
+                # Handle different status codes
+                if status_code == 200:
+                    # Success
+                    return status_code, headers, body
+                    
+                elif status_code == 302:
+                    # Redirect
+                    if 'Location' in headers:
+                        redirect_url = headers['Location']
+                        parsed_redirect = self.parse_url(redirect_url)
+                        
+                        # If redirect URL is relative, make it absolute
+                        if not parsed_redirect.netloc:
+                            redirect_url = self.urljoin(self.base_url, redirect_url)
+                        
+                        # Parse the redirected URL
+                        parsed_url = self.parse_url(redirect_url)
+                        
+                        # Check if the domain is valid for our crawler
+                        if parsed_url.netloc == self.server or not parsed_url.netloc:
+                            redirect_path = parsed_url.path
+                            if parsed_url.query:
+                                redirect_path += f"?{parsed_url.query}"
+                                
+                            # Follow the redirect
+                            return self.send_request(method, redirect_path, headers)
+                    
+                    # If we can't follow the redirect, return the response
+                    return status_code, headers, body
+                    
+                elif status_code == 403 or status_code == 404:
+                    # Forbidden or Not Found - abandon this URL
+                    print(f"Received {status_code} - abandoning URL")
+                    return status_code, headers, body
+                    
+                elif status_code == 503:
+                    # Service Unavailable - retry
+                    print(f"Received 503 - retrying URL (attempt {retries+1}/{max_retries})")
+                    retries += 1
+                    continue
+                    
+                else:
+                    # Unhandled status code
+                    print(f"Unhandled status code: {status_code}")
+                    return status_code, headers, body
+                    
+            except Exception as e:
+                print(f"Error sending request: {e}")
+                retries += 1
+                if retries >= max_retries:
+                    raise
+                    
+        # If we exhausted retries
+        raise Exception(f"Failed after {max_retries} retries")
+    
+    def parse_response(self, response):
+        """Parse HTTP response into status code, headers, and body"""
+        # Split the response into headers and body
+        header_end = response.find("\r\n\r\n")
+        if header_end == -1:
+            # No body
+            headers_section = response
+            body = ""
+        else:
+            headers_section = response[:header_end]
+            body = response[header_end+4:]
+            
+        # Split headers into lines
+        header_lines = headers_section.split("\r\n")
+        
+        # Parse status line
+        status_line = header_lines[0]
+        status_parts = status_line.split(" ", 2)
+        if len(status_parts) < 3:
+            raise Exception(f"Invalid status line: {status_line}")
+            
+        status_code = int(status_parts[1])
+        
+        # Parse headers
+        headers = {}
+        for line in header_lines[1:]:
+            if not line:
+                continue
+                
+            # Split header line by first colon
+            colon_pos = line.find(":")
+            if colon_pos == -1:
+                continue
+                
+            key = line[:colon_pos].strip()
+            value = line[colon_pos+1:].strip()
+            headers[key] = value
+            
+        # Handle chunked encoding
+        if headers.get('Transfer-Encoding') == 'chunked':
+            body = self.decode_chunked(body)
+            
+        # Store cookies
+        if 'Set-Cookie' in headers:
+            self.parse_cookies(headers['Set-Cookie'])
+            
+        return status_code, headers, body
+        
+    def decode_chunked(self, body):
+        """Decode chunked transfer encoding"""
+        decoded = ""
+        while body:
+            # Find the chunk size (hex number followed by CRLF)
+            chunk_size_end = body.find("\r\n")
+            if chunk_size_end == -1:
+                break
+                
+            # Parse chunk size (hex)
+            try:
+                chunk_size = int(body[:chunk_size_end], 16)
+            except ValueError:
+                break
+                
+            # End of chunks
+            if chunk_size == 0:
+                break
+                
+            # Extract chunk data
+            chunk_data_start = chunk_size_end + 2
+            chunk_data_end = chunk_data_start + chunk_size
+            
+            # Check bounds
+            if chunk_data_end > len(body):
+                break
+                
+            # Get the chunk data
+            chunk_data = body[chunk_data_start:chunk_data_end]
+            decoded += chunk_data
+            
+            # Move to next chunk
+            body = body[chunk_data_end+2:]  # Skip CRLF after chunk
+            
+        return decoded
+        
+    def parse_cookies(self, cookie_header):
+        """Parse Set-Cookie header and store cookies"""
+        parts = cookie_header.split(';')
+        if not parts:
+            return
+            
+        # The cookie name=value is the first part
+        cookie_pair = parts[0].strip()
+        if '=' in cookie_pair:
+            name, value = cookie_pair.split('=', 1)
+            self.cookies[name] = value
+            
+    def extract_csrf_token(self, html):
+        """Extract CSRF token from login form"""
+        # Look for the csrf token input field
+        match = re.search(r'<input[^>]*name=["\']csrfmiddlewaretoken["\'][^>]*value=["\']([^"\']+)["\']', html)
+        if match:
+            return match.group(1)
+        return None
+        
+    def extract_links_and_flags(self, html, current_url):
+        """Extract links and flags from HTML content"""
+        parser = HTMLLinkParser()
+        parser.feed(html)
+        
+        # Process links (convert relative to absolute)
+        links = []
+        for link in parser.links:
+            # Skip empty links
+            if not link:
+                continue
+                
+            # Skip JavaScript links
+            if link.startswith('javascript:'):
+                continue
+                
+            # Convert relative URL to absolute
+            absolute_url = self.urljoin(current_url, link)
+            
+            # Parse the URL
+            parsed_url = self.parse_url(absolute_url)
+            
+            # Only consider URLs on the same domain
+            if parsed_url.netloc == self.server or not parsed_url.netloc:
+                links.append(absolute_url)
+                
+        # Extract flags
+        flag_pattern = r'<h3\s+class=["\']secret_flag["\'][^>]*>FLAG:\s*([^<]+)</h3>'
+        flags = re.findall(flag_pattern, html)
+        
+        return links, flags
+        
+    def login(self):
+        """Login to Fakebook"""
+        print("Logging in to Fakebook...")
+        
+        # Get login page to extract CSRF token
+        status, headers, body = self.send_request("GET", "/accounts/login/?next=/fakebook/")
+        
+        if status != 200:
+            raise Exception(f"Failed to get login page: {status}")
+            
+        # Extract CSRF token
+        self.csrf_token = self.extract_csrf_token(body)
+        if not self.csrf_token:
+            raise Exception("Could not find CSRF token on login page")
+            
+        # Prepare login form data
+        login_data = f"username={self.quote(self.username)}&password={self.quote(self.password)}&csrfmiddlewaretoken={self.quote(self.csrf_token)}&next=%2Ffakebook%2F"
+        
+        # Send login request
+        login_headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Referer": self.login_url
+        }
+        
+        status, headers, body = self.send_request(
+            "POST", 
+            "/accounts/login/?next=/fakebook/", 
+            headers=login_headers,
+            body=login_data
+        )
+        
+        # Check if login was successful (should redirect to /fakebook/)
+        if status not in (200, 302):
+            raise Exception(f"Login failed with status: {status}")
+            
+        print("Login successful!")
+        
+        # Add /fakebook/ to frontier
+        self.frontier.append(f"{self.base_url}/fakebook/")
+        
+    def run(self):
+        """Main crawler logic"""
+        try:
+            # Login first
+            self.login()
+            
+            # Crawl until we find 5 flags or exhaust all URLs
+            while self.frontier and len(self.flags) < 5:
+                # Get next URL to crawl
+                current_url = self.frontier.popleft()
+                
+                # Skip if already visited
+                if current_url in self.visited:
+                    continue
+                    
+                # Mark as visited
+                self.visited.add(current_url)
+                
+                # Parse the URL
+                parsed_url = self.parse_url(current_url)
+                path = parsed_url.path
+                if parsed_url.query:
+                    path += f"?{parsed_url.query}"
+                    
+                # If path is empty, use /
+                if not path:
+                    path = "/"
+                    
+                # Fetch the page
+                print(f"Crawling: {current_url}")
+                status, headers, body = self.send_request("GET", path)
+                
+                # Extract links and flags
+                links, new_flags = self.extract_links_and_flags(body, current_url)
+                
+                # Add new flags
+                for flag in new_flags:
+                    flag = flag.strip()
+                    if flag and flag not in self.flags:
+                        self.flags.append(flag)
+                        print(f"Found flag: {flag}")
+                        
+                # Stop if we have found 5 flags
+                if len(self.flags) >= 5:
+                    break
+                    
+                # Add new links to frontier
+                for link in links:
+                    if link not in self.visited:
+                        self.frontier.append(link)
+                        
+            # Print the flags we found
+            for flag in self.flags:
+                print(flag)
+                
+            # If we didn't find 5 flags
+            if len(self.flags) < 5:
+                print(f"Warning: Only found {len(self.flags)} flags out of 5")
+                
+        except Exception as e:
+            print(f"Error: {e}")

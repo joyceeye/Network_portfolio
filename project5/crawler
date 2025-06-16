@@ -1,0 +1,486 @@
+#!/usr/bin/env python3
+
+# pass: 51213e41b7cee1ed4f33281b3fed26577949999c40c39fc477c8fd813b51146a
+import argparse
+import socket
+import ssl
+from html.parser import HTMLParser
+from urllib.parse import urlparse, urljoin, unquote # urllib.parse is allowed, but not urllib
+import re
+from collections import deque
+import time
+
+DEFAULT_SERVER = "fakebook.khoury.northeastern.edu"
+DEFAULT_PORT = 443
+
+class LinkFlagParser(HTMLParser):
+    def __init__(self, base_url, server):
+        super().__init__()
+        self.links = []
+        self.flags = []
+        self.base_url = base_url
+        self.server = server
+        self.in_flag_h3 = False
+        self.current_flag_data = ""
+
+    def handle_starttag(self, tag, attrs):
+        if tag == 'a':
+            href = dict(attrs).get('href')
+            if href and not href.startswith(('javascript:', 'mailto:')):
+                absolute_url = urljoin(self.base_url, href)
+                parsed = urlparse(absolute_url)
+                if parsed.netloc == self.server or not parsed.netloc:
+                    absolute_url = absolute_url.split('#')[0]
+                    if absolute_url not in self.links:
+                        self.links.append(absolute_url)
+                        
+        elif tag == 'h3':
+            attrs_dict = dict(attrs)
+            class_val = attrs_dict.get('class', '')
+            if 'secret_flag' in class_val:
+                self.in_flag_h3 = True
+                self.current_flag_data = ""
+
+    def handle_endtag(self, tag):
+        if tag == 'h3'and self.in_flag_h3:
+            if 'FLAG:' in self.current_flag_data:
+                flag = self.current_flag_data.split('FLAG:')[-1].strip()
+                flag = ''.join(flag.split())  # remove all whitespace
+                # if len(flag) == 64:
+                self.flags.append(flag)
+                # else:
+                #     # print(f"Warning: Found flag with invalid length {len(flag)}")
+            self.in_flag_h3 = False
+
+    def handle_data(self, data):
+        # if self.in_flag_h3 and 'FLAG:' in data:
+        #     flag = data.split('FLAG:')[-1].strip()
+        #     self.flags.append(flag)
+        self.current_flag_data += data
+
+# current_url should be full
+def extract_links_and_flags(self, html, current_url):
+    """Extract links and flags from HTML content"""
+    parser = LinkFlagParser(current_url, self.server)
+    parser.feed(html)
+    return parser.links, parser.flags
+
+class Crawler:
+    def __init__(self, args):
+        self.server = args.server
+        self.port = args.port
+        self.username = args.username
+        self.password = args.password # command line components
+
+        # Store cookies for maintaining session
+        self.cookies = {}
+        
+        # Store visited URLs to avoid loops
+        self.visited = set()
+        
+        # frontier - URLs to be crawled
+        self.frontier = deque()
+        
+        # Collection of found flags
+        self.flags = []
+        
+        # CSRF token for login
+        self.csrf_token = None
+        
+        # Base URL for the site
+        self.base_url =  f"https://{self.server}"
+    
+        # Login URL
+        self.login_url = f"{self.base_url}/accounts/login/?next=/fakebook/"
+        
+        self.domain = self.server
+
+    # define quote used in the login_data:
+    def quote(self, s):
+        """URL encode a string"""
+        safe = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-~"
+        result = ""
+        for c in s:
+            if c in safe:
+                result += c
+            else:
+                result += f"%{ord(c):02X}"
+        return result
+
+    def decode_chunked(self, body):
+        """Decode chunked transfer encoding"""
+        decoded = ""
+        while body:
+            # Find the chunk size (hex number followed by CRLF)
+            chunk_size_end = body.find("\r\n")
+            if chunk_size_end == -1:
+                break
+                
+            # Parse chunk size (hex)
+            try:
+                chunk_size = int(body[:chunk_size_end], 16)
+            except ValueError:
+                break
+                
+            # End of chunks
+            if chunk_size == 0:
+                break
+                
+            # Extract chunk data
+            chunk_data_start = chunk_size_end + 2
+            chunk_data_end = chunk_data_start + chunk_size
+            
+            # Check bounds
+            if chunk_data_end > len(body):
+                break
+                
+            # Get the chunk data
+            chunk_data = body[chunk_data_start:chunk_data_end]
+            decoded += chunk_data
+            
+            # Move to next chunk
+            body = body[chunk_data_end+2:]  # Skip CRLF after chunk
+            
+        return decoded
+
+    def extract_links_and_flags(self, html, current_url):
+        """Extract links and flags from HTML content"""
+        parser = LinkFlagParser(current_url, self.server)
+        parser.feed(html)
+        return parser.links, parser.flags
+        
+    # response type: 
+    def parse_response(self, response):
+        """includes status_num, headers, body"""
+        header_section = ""
+        header_end = response.find("\r\n\r\n")
+
+        if header_end == -1:
+            header_section = response
+            # print(f"Debug -- response is: {response}")
+            body = "" # no body
+        else:
+            header_section = response[:header_end]
+            body = response[header_end+4:] #after headers and delimiter
+
+        status_line = response.split("\r\n", 1)[0]
+        # print(f"status_line is: {status_line}")
+        status_txt = status_line.split()
+        status_num = int(status_txt[1])
+        # #headers
+        header_lines = header_section.split("\r\n")
+
+        if status_num is None:
+            raise ValueError(f"status line no value: {status_line}")
+
+        # stores it in dictionary
+        headers = {}
+        for line in header_lines[1:]:
+            # if empty
+            if not line: 
+                continue
+
+            # use ":" to seperate each parts of codes
+            for line in header_lines:
+                if ':' in line:
+                    key, value = line.split(':', 1)
+                    headers[key.strip().lower()] = value.strip()
+
+        # used in further request
+        if "set-cookie" in headers:
+            self.parse_cookies(headers['set-cookie'])
+
+        if headers.get('Transfer-Encoding') == 'chunked':
+            body = self.decode_chunked(body)
+        
+        return status_num, headers, body
+
+    # implement TLS:
+    def create_tls_connect(self):
+        mysocket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        context = ssl.create_default_context()
+
+        wrapped_mysocket = context.wrap_socket(mysocket, server_hostname=self.server)
+        wrapped_mysocket.connect((self.server, self.port))
+        return wrapped_mysocket
+    
+    # includes the header treatments # format needs to further check with the gradescope
+    def send_requests(self, Method, path, headers=None, body=None):
+        """
+        Send HTTP request and handle redirects, retries, and cookies.
+        Returns: status_code, headers, body
+        """
+        while True:
+            # --- Build request ---
+            request = f"{Method} {path} HTTP/1.1\r\n"
+
+            if headers is None:
+                headers = {}
+            else:
+                headers = headers.copy()
+            # headers.setdefault("User-Agent", "Mozilla/5.0 (compatible; my-crawler/1.0)")
+
+            # Required headers
+            headers.setdefault("Host", self.server)
+            headers.setdefault("Connection", "close")
+
+            if Method == "POST" and body:
+                headers["Content-Length"] = str(len(body))
+                # print("\n=== Debugging POST ===")
+                # print(f" POST request is: {request}")
+
+            # Add cookies
+            if self.cookies:
+                cookie_str = "; ".join(f"{k}={v}" for k, v in self.cookies.items())
+                headers["Cookie"] = cookie_str
+
+            # Add headers to request
+            for key, value in headers.items():
+                request += f"{key}: {value}\r\n"
+            request += "\r\n"
+
+            if body:
+                request += body
+
+            # print(f"request is: {request}")
+
+            # --- Send request ---
+            mysocket = self.create_tls_connect()
+            mysocket.sendall(request.encode('utf-8'))
+            response = b""
+            while True:
+                data = mysocket.recv(4096)
+                if not data:
+                    break
+                response += data
+            mysocket.close()
+
+            # --- Parse response ---
+            decoded = response.decode('utf-8', errors='ignore')
+            status_code, response_headers, body = self.parse_response(decoded)
+
+            # --- Parse cookies ---
+            if 'set-cookie' in response_headers:
+                self.parse_cookies(response_headers['set-cookie'])
+            # store the cookie
+
+            # --- Retry on 503 or empty 200 ---
+            if (status_code == 503 or 
+                (status_code == 200 and response_headers.get('content-length') == '0')):
+                # print("503 or empty response — retrying...")
+                continue  # retry the request
+
+            # --- Handle 302 redirect ---
+            if status_code == 302:
+
+                redirect_location = response_headers.get("location")
+
+                if not redirect_location:
+                    # print("302 but no Location header found.")
+                    return status_code, response_headers, body
+
+                parsed = urlparse(redirect_location)
+                redirect_path = parsed.path
+                if parsed.query:
+                    redirect_path += f"?{parsed.query}"
+
+                if parsed.netloc and parsed.netloc != self.server:
+                    # print(f"Skipping external redirect to: {redirect_location}")
+                    return status_code, response_headers, body
+
+                # get with a new path to visit
+                return self.send_requests("GET", redirect_path)
+
+                # print(f"Following redirect to: {redirect_path}")
+                return self.send_requests(Method, redirect_path, headers)
+
+            # --- Normal case ---
+            return status_code, response_headers, body
+            
+    
+    # different method - conduct in different function
+    def download_pgs(self, path):
+        self.send_requests("GET", path)
+    
+    def extract_csrf_token(self, html):
+        """Extract CSRF token from login form"""
+        # Look for the csrf token input field
+        match = re.search(r'<input[^>]*name=["\']csrfmiddlewaretoken["\'][^>]*value=["\']([^"\']+)["\']', html)
+        if match:
+            return match.group(1)
+        return None
+    
+    def parse_cookies(self, cookie_header):
+        """parse cookies get from response and store"""
+        if not cookie_header:
+            return
+        
+        cookie_parts = cookie_header.split(';')
+        cookie_pair = cookie_parts[0].strip()  # Name=Value is the first part
+        if '=' in cookie_pair:
+            key, value = cookie_pair.split('=', 1)
+            self.cookies[key] = value
+            # print(f"Stored cookie: {key}={value}")
+
+    def login(self):
+        """Login to Fakebook with username and password from command line"""
+        # print("Logging in to Fakebook...")
+        # Clear any existing session cookies to start fresh
+        for key in list(self.cookies.keys()):
+            if key in ['sessionid', 'csrftoken']:
+                del self.cookies[key]
+        
+        # Step 1: GET the login page to obtain CSRF token
+        status, headers, body = self.send_requests("GET", "/accounts/login/")
+        # # print(f"Get request is: {status, headers, body}")
+
+        if status != 200:
+            # print(f"Failed to get login page: Status {status}")
+            return False
+        
+        # Extract CSRF token from the login page
+        self.csrf_token = self.extract_csrf_token(body)
+        # print(f"Extracted CSRF token: {self.csrf_token}")
+        
+        if not self.csrf_token:
+            # print("Could not find CSRF token on login page")
+            return False
+        
+        if 'csrftoken' not in self.cookies:
+            # print("Warning: csrftoken not in cookies, adding it manually")
+            self.cookies['csrftoken'] = self.csrf_token
+    
+        # Step 2: Prepare the login form data with username, password and CSRF token
+        login_data = (
+            f"username={self.quote(self.username)}&"
+            f"password={self.quote(self.password)}&"
+            f"csrfmiddlewaretoken={self.quote(self.csrf_token)}&"
+            f"next=%2Ffakebook%2F"
+        )
+        # # print(f"Debug -- Outgoing login_data is: {login_data}")
+
+        # Set up headers for the POST request
+        login_headers = {
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Referer": f"https://{self.server}:{self.port}/accounts/login/?next=/fakebook/",
+            "Cookie": f"csrftoken={self.csrf_token}" # Contet-length
+        }
+        
+        # # print(f"Debug -- Outgoing login_headers is: {login_headers}")
+
+        # Step 3: Send the login POST request
+        status, headers, body = self.send_requests(
+            "POST", 
+            "/accounts/login/", 
+            headers=login_headers,
+            body=login_data
+        )
+
+        # print(f"after post....")
+        # print(f"Login response status: {status}")
+        # print(f"Cookies after login attempt: {self.cookies}")
+    
+        # Check if we have a sessionid cookie
+        if 'sessionid' in self.cookies:
+            # print("Login successful! Session cookie received.")
+            # current_url = self.frontier.append(f"{self.base_url}/fakebook/")
+            # links = extract_links_and_flags(body, current_url)
+            return True
+        
+        # Try one more direct GET to /fakebook/ to see if we're logged in
+        # status, headers, body = self.send_requests("GET", "/fakebook/")
+        else: 
+            # print("Login failed.")
+            return True
+    
+
+    def run(self):
+        # print("Starting Fakebook crawler to find 5 secret flags...")
+        login_result = self.login()
+        # if login_result:
+        #     # print("Successfully logged in, beginning crawl")
+        # else:
+        #     # print("Login unsuccessful, attempting crawl anyway")
+        
+        if not self.frontier:
+            self.frontier.append(f"{self.base_url}/fakebook/")
+
+        while self.frontier and len(self.flags) < 5:
+            current_url = self.frontier.popleft()
+            if "/logout" in current_url: # key add-ins
+                continue
+            if current_url in self.visited:
+                continue
+            
+            self.visited.add(current_url)
+            # print(f"current_url is: {current_url}")
+
+            parsed_url = urlparse(current_url)
+            path = parsed_url.path
+            if parsed_url.query:
+                path += f"?{parsed_url.query}"
+            # else:
+            #     path = current_url
+            
+            # Fetch the page
+            status, headers, body = self.send_requests("GET", path)
+            
+            ##### checks the issues here!!
+            # Process based on status code
+            if status == 200:
+                full_url = current_url
+                if not full_url.startswith("http"):
+                    full_url = f"{self.base_url}{current_url}"
+                
+                links, new_flags = self.extract_links_and_flags(body, full_url)
+                
+                # Add new links to frontier
+                links_added = 0
+                for link in links:
+                    if link not in self.visited and link not in self.frontier:
+                        self.frontier.append(link)
+                        links_added += 1
+                
+                # print(f"Added {links_added} new URLs to frontier")
+                
+                # Process any flags found
+                for flag in new_flags:
+                    flag = flag.strip()
+                    if flag and flag not in self.flags:
+                        self.flags.append(flag)
+                        print(flag)
+                    
+                    with open("secret_flags", "a") as f:
+                        f.write(flag + "\n")
+
+            # # Handle other status codes
+            # elif status == 403 or status == 404:
+            #     # Abandon this URL as instructed
+            #     # print(f"Skipping URL {path} due to {status} status")
+            
+            # elif status == 503:
+            #     # This should be handled in send_requests with retry logic
+            #     # print(f"Received 503 for {path} - should have been retried in send_requests")
+        
+        ## # print out...
+        # # Print summary of flags found
+        # # print("\n=== Crawling Complete ===")
+        # # print(f"Total URLs visited: {len(self.visited)}")
+        # # print(f"Total URLs visited: {self.visited}")
+        # # print(f"Flags found: {len(self.flags)}/5")
+        
+        # if self.flags:
+        # #     # print("\nFlags:")
+        # #     for i, flag in enumerate(self.flags, 1):
+        #     # print(f"{flag}")
+        
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='crawl Fakebook')
+    parser.add_argument('-s', dest="server", type=str, default=DEFAULT_SERVER, help="The server to crawl")
+    parser.add_argument('-p', dest="port", type=int, default=DEFAULT_PORT, help="The port to use")
+    parser.add_argument('username', type=str, help="The username to use")
+    parser.add_argument('password', type=str, help="The password to use")
+    args = parser.parse_args()
+    sender = Crawler(args)
+    sender.run()
