@@ -1,0 +1,207 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, time, json, select, struct, sys, math
+import zlib
+
+class Receiver:
+    def __init__(self):
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('0.0.0.0', 0))
+        self.port = self.socket.getsockname()[1]
+        self.log("Bound to port %d" % self.port)
+
+        self.remote_host = None
+        self.remote_port = None
+
+    # check for data corruption:
+    def calculate_checksum(self, data, seq):
+        seq_bytes = str(seq).encode('utf-8')
+        if isinstance(data, str):
+            data_bytes = data.encode('utf-8')
+        else:
+            data_bytes = str(data).encode('utf-8')
+        return zlib.crc32(seq_bytes + data_bytes) & 0xffffffff
+
+    def calculate_ack(self, seq):
+        seq_bytes = str(seq).encode('utf-8')
+        return zlib.crc32(seq_bytes) & 0xffffffff
+
+    # helpers: checksum verify
+    def verify_checksum(self, message):
+        if 'checksum' not in message:
+            return False
+            
+        received_checksum = message['checksum']
+        
+        # For data packets
+        if message['type'] == 'msg':
+            if 'data' not in message:
+                self.log("Missing data field in message")
+                return False
+            calculated_checksum = self.calculate_checksum(message['data'], message['seq'])
+        # For ACK packets
+        elif message['type'] == 'ack':
+            calculated_checksum = self.calculate_ack(message['seq'])
+        else:
+            self.log(f"Unknown message type: {message['type']}")
+            return False
+        
+        # Debuhg: Compare checksums
+        matches = received_checksum == calculated_checksum
+        if not matches:
+            self.log(f"Checksum mismatch! Received: {received_checksum}, Calculated: {calculated_checksum}")
+        else:
+            self.log(f"Checksum verified successfully for seq={message['seq']}")
+        
+        return matches
+
+    def send(self, message):
+
+        if message['type'] == 'ack':
+            message['checksum'] = self.calculate_ack(message['seq'])
+            
+        self.log("Sent message %s" % json.dumps(message))
+        
+        self.log("Sent message %s" % json.dumps(message))
+        self.socket.sendto(json.dumps(message).encode("utf-8"), (self.remote_host, self.remote_port))
+
+        # if message['type'] == 'msg':
+        #     message['checksum'] = self.calculate_checksum(message['data'], message['seq'])
+        # elif message['type'] == 'ack':
+        #     message['checksum'] = self.calculate_ack(message['seq'])
+        
+        # # Log what we're sending
+        # msg_type = message.get('type', 'unknown')
+        # seq = message.get('seq', 'unknown')
+        # self.log(f"Sending {msg_type} packet with seq={seq}")
+        
+        # # Ensure we have a destination
+        # if self.remote_host is None or self.remote_port is None:
+        #     self.log("Cannot send message: remote host/port not set")
+        #     return
+        
+        # try:
+        #     # Convert to JSON and send
+        #     json_data = json.dumps(message)
+        #     self.socket.sendto(json_data.encode('utf-8'), (self.remote_host, self.remote_port))
+        # except Exception as e:
+        #     self.log(f"Error sending message: {str(e)}")
+
+    def is_corrupted(self, data_str):
+        if 'X' in data_str:
+            return True
+        return False
+
+    def recv(self, socket):
+        try: 
+            data, addr = socket.recvfrom(65535)
+
+            # Grab the remote host/port if we don't already have it
+            if self.remote_host is None:
+                self.remote_host = addr[0]
+                self.remote_port = addr[1]
+
+            # Make sure we're talking to the same remote host
+            if addr != (self.remote_host, self.remote_port):
+                self.log("Error:  Received response from unexpected remote; ignoring")
+                return None
+            else:
+                self.log("Received message %s" % data)
+                return json.loads(data.decode("utf-8"))
+
+            # Try to decode and parse the message
+            try:
+                data_str = data.decode("utf-8", errors="strict")
+                
+                # Check for obvious corruption ('X' characters)
+                if 'X' in data_str:
+                    self.log("Corrupted packet detected with 'X' characters")
+                    return None
+                
+                # Try to parse the JSON
+                message = json.loads(data_str)
+                
+                # Check for required fields
+                if not all(key in message for key in ["type", "seq"]):
+                    self.log("Missing required fields in message")
+                    return None
+                    
+                # basic parsing succeeded
+                return message
+                
+            except UnicodeDecodeError as e:
+                self.log(f"UTF-8 decode error: {e}")
+                return None
+                
+            except json.JSONDecodeError as e:
+                self.log(f"JSON parse error: {e}")
+                return None
+
+        except json.JSONDecodeError as e:
+            self.log(f"Corrupted packet detected: JSON decode failed - {str(e)} ")
+            return None
+
+
+    def log(self, message):
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+
+
+    # level-3: implement a “window” at the receiver, as it may receive a packet but not be able to print it out.
+    def run(self):
+        # level-2: treats duplicates package
+        last_packet_received = -1
+        expected_seq = 0 # expected seq to process
+        buffer = {}
+
+        while True:
+            socks = select.select([self.socket], [], [])[0]
+            for conn in socks:
+                msg = self.recv(conn)
+                # self.log(f"msg received was: {msg}")
+
+                if msg is None or self.is_corrupted(msg):
+                    self.log(f"Detected corrputed packets.")
+                    continue
+                if not self.verify_checksum(msg):
+                    continue
+                if msg['type'] != 'msg':
+                    self.log(f"Received non-data msg: {msg['type']}")
+                    continue
+                    
+                    if msg['type'] == 'ack':
+                        self.log(f"Received ACK for sequence: {msg['seq']}")
+                    continue
+
+                if 'data' not in msg:
+                    self.log(f"Received msg packet without data field: {msg}")
+                    self.send({"type": "ack", "seq": msg["seq"]})
+                    continue
+
+                seq = msg['seq']
+                data = msg["data"]
+                self.send({ "type": "ack", "seq": msg["seq"] })
+
+                if seq == expected_seq:
+                    # Print out the data to stdout
+                    print(msg["data"], end='', flush=True)
+                    expected_seq += 1
+
+                    while expected_seq in buffer:
+                        print(buffer[expected_seq], end='', flush=True)
+                        del buffer[expected_seq]
+                        self.log(f"proceed to the next buffer: {expected_seq}")
+                        expected_seq += 1
+
+                elif seq > expected_seq:
+                    self.log(f"Buffering out-of-order packet with seq {seq}")
+                    buffer[seq] = data
+                else:
+                    self.log(f"Debug - Duplicate seq packet: {msg['seq']}")
+
+    
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='receive data')
+    args = parser.parse_args()
+    sender = Receiver()
+    sender.run()

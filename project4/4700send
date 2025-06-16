@@ -1,0 +1,279 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, time, json, select, struct, sys, math
+import zlib
+
+DATA_SIZE = 1375
+
+class Sender:
+    Alpha = 0.125
+    # beta = 0.1
+    default_rtt = 0.1
+
+    def __init__(self, host, port):
+        self.host = host
+        self.port = int(port)
+        self.log("Sender starting up using port %s" % self.port)
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(('0.0.0.0', 0))
+        self.waiting = False
+
+        self.remote_host = None
+        self.remote_port = None
+
+        self.srtt = self.default_rtt # smooth rtt
+        self.RTO = 2 * self.srtt
+
+        self.based_win_size = 4
+        self.cwnd = self.based_win_size
+        self.ssthresh = 16
+        self.min_cwnd = 1
+        self.last_ack = None
+
+        self.window = []
+        self.window_base = 0
+        self.end_of_input = False
+        self.RTT = 1
+        self.timeout_interval = 1  # Initial timeout value
+        self.dev_rtt = 0
+
+    # use as print to detect errors
+    def log(self, message):
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush()
+    
+    # check for data corruption:
+    def calculate_checksum(self, data, seq):
+        seq_bytes = str(seq).encode('utf-8')
+        if isinstance(data, str):
+            data_bytes = data.encode('utf-8')
+        else:
+            data_bytes = str(data).encode('utf-8')
+        return zlib.crc32(seq_bytes + data_bytes) & 0xffffffff
+
+    def calculate_ack(self, seq):
+        seq_bytes = str(seq).encode('utf-8')
+        return zlib.crc32(seq_bytes) & 0xffffffff
+        
+    def send(self, message):
+        if message['type'] == 'msg':
+            message['checksum'] = self.calculate_checksum(message['data'], message['seq'])
+        elif message['type'] == 'ack':
+            message['checksum'] = self.calculate_ack(message['seq'])
+        
+        # Log what we're sending
+        msg_type = message.get('type', 'unknown')
+        seq = message.get('seq', 'unknown')
+        self.log(f"Sending {msg_type} packet with seq={seq}")
+        
+        try:
+            # Convert to JSON and send
+            json_data = json.dumps(message)
+            self.socket.sendto(json_data.encode('utf-8'), (self.host, self.port))
+        except Exception as e:
+            self.log(f"Error sending message: {str(e)}")
+
+    # level 4: RTO = 2 * new_RTT
+    def calculate_rto(self, sample_rtt):
+        self.srtt = (1 - self.Alpha) * self.srtt + self.Alpha * sample_rtt
+        # # self.RTO = max(0.1, self.RTO) # at least 100ms
+        self.RTO = max(0.5, min(10.0, 2 * self.srtt))
+
+        # self.dev_rtt = (1 - self.beta) * self.dev_rtt + self.beta * abs(sample_rtt - self.srtt)
+        # self.timeout_interval = max(0.5, min(10.0, self.srtt + 4 * self.dev_rtt))
+        
+
+    def is_corrupted(self, data_str):
+        if 'X' in data_str:
+            return True
+        return False
+
+    # updates on recv since the checksum for data corruption added!
+    def recv(self, socket):
+
+        try: 
+            data, addr = socket.recvfrom(65535)
+
+            # Grab the remote host/port if we don't already have it
+            if self.remote_host is None:
+                self.remote_host = addr[0]
+                self.remote_port = addr[1]
+
+            # Make sure we're talking to the same remote host
+            if addr != (self.remote_host, self.remote_port):
+                self.log("Error:  Received response from unexpected remote; ignoring")
+                return None
+            else:
+                self.log("Received message %s" % data)
+                return json.loads(data.decode("utf-8"))
+
+            try:
+                # First, try to decode the bytes to UTF-8 string
+                data_str = data.decode("utf-8", errors="strict")
+                
+                # Check for obvious corruption ('X' characters)
+                if 'X' in data_str:
+                    self.log("Corrupted packet detected with 'X' characters")
+                    return None
+                
+                # Try to parse the JSON
+                message = json.loads(data_str)
+                
+                # Check for required fields
+                if not all(key in message for key in ["type", "seq"]):
+                    self.log("Missing required fields in message")
+                    return None
+                    
+                # basic parsing succeeded
+                return message
+            
+            except UnicodeDecodeError as e:
+                self.log(f"UTF-8 decode error: {e}")
+                return None
+                
+            except json.JSONDecodeError as e:
+                self.log(f"JSON parse error: {e}")
+                return None
+    
+        except Exception as e:
+            # Catch any other unexpected errors
+            self.log(f"Error receiving data: {str(e)}")
+            return None
+
+    def adjust_window(self, ack):
+        """Adjust congestion window based on network feedback."""
+        if self.cwnd < self.ssthresh:
+            self.cwnd += 1  # Slow start
+        else:
+            self.cwnd += 1 / self.cwnd  # Congestion avoidance
+        
+        self.last_ack = ack
+        print(f"New cwnd: {self.cwnd:.3f}")
+
+        # min(cwnd, rwnd)
+
+    # retransmit data-loss packet
+    def on_timeout(self):
+        """Handle timeout event with multiplicative decrease."""
+        print("Timeout occurred. Reducing window size.")
+        self.ssthresh = max(self.cwnd // 2, self.min_cwnd)
+        self.cwnd = 1  # Reset to 1 after timeout
+        # self.timeout_interval = min(10.0, max(0.5, 2 * self.RTT)) # key improvement for 7-1
+        # self.timeout_interval = 2 * self.srtt
+        self.timeout_interval = max(0.5, min(8.0, 2 * self.srtt))
+
+    # level-2: check for duplicate packets (by seq number)
+    # level-1: include the window_size = 2 (keeps for futher test:)
+    # implement level4 of test: packet loss detection; retransmit packet that detects loss
+    def run(self):
+        seq = 0
+
+        sent_packets = {}
+        unacked_packets = {}
+        
+        while True:
+            sockets = [self.socket]
+            # if it is full -> never go through this prompt
+            if len(self.window) < self.cwnd and not self.end_of_input:
+                sockets.append(sys.stdin)
+            
+            socks = select.select(sockets, [], [], 0.1)[0]
+            
+            for conn in socks:
+                if conn == self.socket:
+                    data = self.recv(conn)
+                    
+                    # recv ack #
+                    if data:
+                        ack_seq = data.get("seq")
+                        self.log(f"Received ACK for sequence: {ack_seq}")
+                        self.waiting = False
+                        self.adjust_window(ack_seq)
+                        
+                    # updates the rtt:
+                    if ack_seq in sent_packets:
+                        sample_rtt = time.time() - sent_packets[ack_seq]
+                        a = self.calculate_rto(sample_rtt)
+                        self.log(f"Debug -- RTO is:{a}")
+                        del sent_packets[ack_seq]
+                        del unacked_packets[ack_seq]
+
+                    # remove acknowledged window from the packet
+                    for i, packet in enumerate(self.window):
+                        if packet['seq'] == ack_seq:
+                            self.window.pop(i)
+                            self.log(f"removed seq {ack_seq} from window.")
+                            break
+                            
+                    # Update window base if necessary
+                    if ack_seq == self.window_base:
+                        self.window_base += 1
+                        # Adjust window_base to the smallest unacked sequence
+                        if self.window:
+                            min_seq = min(p["seq"] for p in self.window)
+                            self.window_base = min(min_seq, self.window_base)
+
+                # data ready for reading
+                elif conn == sys.stdin and len(self.window) < self.cwnd:
+                    data = sys.stdin.read(DATA_SIZE)
+                    self.log(f"Data read was: {data}") # for the level-2 test: no data available
+
+                    if len(data) == 0:  
+                        self.log(f"End of input reached!")
+                        self.end_of_input = True
+                        # when window is empty
+                        if len(self.window) == 0:
+                            self.log(f"Debug -- no window available")
+                            self.log("All done!")
+                            sys.exit(0)
+                        continue
+
+                    # create packet and send
+                    msg = { "type": "msg", "data": data, "seq": seq}
+
+                    checksum_value = self.calculate_checksum(data, seq)
+                    msg['checksum'] = checksum_value # add checksum in msg
+
+                    # could be duplicates packets before send
+                    self.send(msg)
+                    sent_packets[seq] = time.time()
+                    unacked_packets[seq] = msg
+
+                    # add the packets to the window
+                    self.window.append(msg)
+                    self.log(f"Add seq {seq} to window.")
+
+                    # self.waiting = True # will prevent further packet send
+                    seq += 1
+            
+            # level 4: RTT
+            current_time = time.time()
+            for packet_seq in list(sent_packets.keys()):
+                # time-out interval increasing -> less retransmitting
+                if current_time - sent_packets[packet_seq] > self.RTT:
+                    self.log(f"Time outs: for seq{packet_seq}, retransmitting..")
+
+                    if packet_seq in unacked_packets:
+                        self.send(unacked_packets[packet_seq])
+                        sent_packets[packet_seq] = time.time()
+                    self.on_timeout() # reduce congestion window after time outs
+
+            # two packets reached -> check if all of the packets has been send
+            if len(self.window) == 0 and self.end_of_input:
+                self.log(f"Debug -- no window available")
+                self.log("All done!")
+                sys.exit(0)
+
+    # Datagrams generated by your programs must each contain less than or equal to 1500 bytes of data. 
+    # Any datagrams sent with more data that that will be dropped.
+
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='send data')
+    parser.add_argument('host', type=str, help="Remote host to connect to")
+    parser.add_argument('port', type=int, help="UDP port number to connect to")
+    args = parser.parse_args()
+    sender = Sender(args.host, args.port)
+    sender.run()
+
