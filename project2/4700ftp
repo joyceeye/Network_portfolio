@@ -1,0 +1,347 @@
+#!/usr/bin/env python3
+"""Project2: clinet side code"""
+# the following modules would not be allowed: urllib.request, ftplib, and pycurl.
+# command line used: ./4700ftp.py ls ftp://ftp.4700.network/
+
+import socket
+import argparse
+import sys
+from urllib.parse import urlparse, unquote
+import re
+
+# ftp://[USER[:PASSWORD]@]HOST[:PORT]/PATH
+def parse_ftp_url(url):
+    o = urlparse(url)
+
+    user = o.username or 'anonymous'
+    password = o.password if o.password is not None else ''
+    host = o.hostname
+    port = o.port or 21
+    path = unquote(o.path) or '/'
+
+    print(f"scheme is: {o.scheme}")
+    print(f"netloc is: {o.netloc}")
+    print(f"/// path is {o.path}")
+    # print(f"username is: {o.hostname}")
+
+    return {
+        'user': user,
+        'password': password,
+        'host': host,
+        'port': port,
+        'path': path
+    }
+
+def connect_to_FTP(host, port):
+    # check for the passin args
+    print(f"Debug args: hostname is: {host}, port is: {port}")
+    ftp_client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    ftp_client.connect((host, port))
+
+    # recv msg from the remote server(hello msg)
+    response = ftp_client.recv(1024).decode()
+    print(f"response data is: {response}")
+
+    return ftp_client
+
+
+def setup_data_channel(ftp_client):
+    # Send PASV command
+    pasv_cmd = "PASV\r\n"
+    ftp_client.send(pasv_cmd.encode())
+    pasv_response = ftp_client.recv(1024).decode()
+    print(f"PASV response data is: {pasv_response}")
+    
+    # Parse PASV response for IP and port
+    pattern = r'\(([0-9,]+)\)'
+    match = re.search(pattern, pasv_response)
+    print(f"match is: {match}")
+    # if not match:
+    #     raise ValueError(f"Invalid PASV response: {pasv_response}")
+        
+    parsed_nums = match.group(1).split(',')
+    if len(parsed_nums) != 6:
+        raise ValueError(f"Invalid PASV response format: {pasv_response}")
+        
+    parsed_ip = '.'.join(parsed_nums[:4]) # first four number
+    print(f"parsed_ip is: {parsed_ip}")
+    parsed_port = (int(parsed_nums[4]) << 8) + int(parsed_nums[5])
+    print(f"parsed_port is: {parsed_port}")
+    
+    # Create and connect data socket
+    data_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    data_socket.connect((parsed_ip, parsed_port))
+    
+    return data_socket
+
+# # parser argument:
+#     # $ ./4700ftp [operation] [param1] [param2]
+#     # parm should be the directory to the files
+# parser = argparse.ArgumentParser(add_help=False)
+
+# # optional for --h and --verbose
+# parser.add_argument("-h", "--help", action = "help", default=argparse.SUPPRESS,
+#                 help='Show this help message and exit.')
+# parser.add_argument("--verbose",'-v', action='store_true', help = "Print all messages to and from the FTP server")
+
+# parser.add_argument('operation', choices=['ls', 'mkdir', 'rmdir', 'rm', 'cp','mv'], help="operations to perform")
+# parser.add_argument('param1',help='First parameter - can be local path or FTP URL')
+# parser.add_argument('param2',nargs='?',  # Optional for operations other than cp/mv
+#                    help='Second parameter - required for cp/mv, can be local path or FTP URL')
+# # subcommandsL: cp <ARG1> <ARG2>
+# # subcommandsL: mv <ARG1> <ARG2>
+
+
+# debug for my handle_two_path function
+# handles two path: upload(cp)/ download(mv)
+def handle_two_path(src, dest): # change to the path and path2
+
+    print(f"src is {src} ")
+    print(f"dest is {dest} ")
+    src_is_ftp = src.startswith("ftp://") # startswith ->return: Bool
+    print(f"src_is_ftp is: {src_is_ftp}")
+    dest_is_ftp = dest.startswith("ftp://")
+    print(f"dest_is_ftp is: {dest_is_ftp}")
+    upload = None
+    local_path = None
+
+    # if src_is_ftp == dest_is_ftp:
+    #     raise ValueError("One argument must be a local file and one must be a URL")
+
+    if src_is_ftp:
+        # ftp_info = parse_ftp_url(src)
+        # print(f"ftp_info is: {ftp_info}")
+        upload = False  # download from URL
+        local_path = dest
+
+    if dest_is_ftp:
+        # ftp_info = parse_ftp_url(dest)
+        # print(f"ftp_info is: {ftp_info}")
+        upload = True  # upload to URL
+        local_path = src # seems like src could not be opened
+    
+    print(f"upload, local_path is: {upload}, {local_path}")
+    return upload, local_path
+
+
+# where all of the commands goes in
+def main(*args):
+
+    # parser argument:
+    # $ ./4700ftp [operation] [param1] [param2]
+    # parm should be the directory to the files
+    parser = argparse.ArgumentParser(add_help=False)
+
+    # optional for --h and --verbose
+    parser.add_argument("-h", "--help", action = "help", default=argparse.SUPPRESS,
+                    help='Show this help message and exit.')
+    parser.add_argument("--verbose",'-v', action='store_true', help = "Print all messages to and from the FTP server")
+
+    parser.add_argument('operation', choices=['ls', 'mkdir', 'rmdir', 'rm', 'cp','mv'], help="operations to perform")
+    parser.add_argument('param1',help='First parameter - can be local path or FTP URL')
+    parser.add_argument('param2',nargs='?',  # Optional for operations other than cp/mv
+                    help='Second parameter - required for cp/mv, can be local path or FTP URL')
+    # subcommandsL: cp <ARG1> <ARG2>
+    # subcommandsL: mv <ARG1> <ARG2>
+
+    print(f"Argument received are: {args}")
+    args = parser.parse_args(args)
+    print(f"argument is {args}")
+
+
+    # Parse URL and establish control channel
+
+    # check which argument should be the ftp url
+    if args.param1.startswith("ftp://"):
+        param_is_url = args.param1
+    else:
+        param_is_url = args.param2
+    print(f"param_is_url is: {param_is_url}")
+    # url_info = parse_ftp_url(param_is_url)
+
+    if args.operation not in ['cp', 'mv']:
+        url_info = parse_ftp_url(param_is_url)
+        print(f"Parsed URL info: {url_info}")
+        print(f"After parse function check the path: {url_info['path']}") # path is def in the parse_url function
+
+    else:
+        if not args.param2:
+            raise ValueError(f"{args.operation} operation requires two parameters")
+        
+        upload, local_path = handle_two_path(args.param1, args.param2)
+        print(f"upload or not: {upload}")
+        print(f"local_path is: {local_path}")
+
+
+    #### not commit yet
+    # connects to the server:
+    # param1 could not always ensure is the ftp URL, needs to be the ftp url
+    url_info = parse_ftp_url(param_is_url)
+    print(f"url_info host is: {url_info['host']}, url_info port is: {url_info['port']}")
+    ftp_client = connect_to_FTP(url_info['host'], url_info['port'])
+
+    # Login
+     # FTP first Command: USER <username>\r\n
+    if url_info['user'] is None:
+        user = f"USER anonymous\r\n"
+    else: 
+        user = f"USER {url_info['user']}\r\n"
+        print(f"checking for username: {user}")
+
+    user_data = ftp_client.send(user.encode())
+    # checking for the msg recv by the FTP server
+    user_response = ftp_client.recv(1024).decode()
+    print(f"USER response data is: {user_response}")
+
+    # FTP second Command: PASS <password>\r\n
+    if 'password' in url_info and url_info['password']:
+        password = f"PASS {url_info['password']}\r\n"
+        print(f"checking for password: {password}")
+        password_data = ftp_client.send(password.encode())
+        pass_response = ftp_client.recv(1024).decode()
+        print(f"PASS response data is: {pass_response}")
+    
+    # settings before upload/downloads files
+    if args.operation in ['cp', 'mv', 'ls']:
+        # TYPE I\r\n
+        type = "TYPE I\r\n"
+        print(f"checking for TYPE: {type}")
+        ftp_client.send(type.encode())
+        type_response = ftp_client.recv(1024).decode()
+        print(f"TYPE response data is: {type_response}")
+
+        # MODE S\r\n
+        mode = "MODE S\r\n"
+        print(f"checking for MODE: {mode}")
+        ftp_client.send(mode.encode())
+        mode_response = ftp_client.recv(1024).decode()
+        print(f"TYPE response data is: {mode_response}")
+
+        # STRU F\r\n: raw stream of bytes
+        stru = "STRU F\r\n"
+        print(f"checking for STRU: {stru}")
+        ftp_client.send(stru.encode()) # change to stru
+        stru_response = ftp_client.recv(1024).decode()
+        print(f"TYPE response data is: {stru_response}")
+
+    # MKD and RMD. (no data channel)
+    # MKD <path-to-directory>\r\n
+    if args.operation == 'mkdir':
+        target_path = url_info['path']
+        print(f"Create {target_path} on {args.param1}")
+        
+        # Send MKD command
+        mkd_command = f"MKD {target_path}\r\n"
+        print(f"Create directory {target_path} on {args.param1}")
+        mkd_data = ftp_client.send(mkd_command.encode())
+        mkd_response = ftp_client.recv(1024).decode()
+        print(f"MKD response data is: {mkd_response}")
+
+    elif args.operation == 'rmdir':
+        target_path = url_info['path']
+        print(f"Delete {target_path} on {args.param1}")
+
+        # RMD <path-to-directory>\r\n
+        rmd_command = f"RMD {target_path}\r\n"
+        mkd_data = ftp_client.send(rmd_command.encode())
+        rmd_response = ftp_client.recv(1024).decode()
+        print(f"RMD response data is: {rmd_response}")
+
+    ##### alter when others was done
+    # DELE <path-to-file>\r\ -- should be in the data channel
+    elif args.operation == 'rm':
+        target_path = url_info['path']
+        print(f"Delete {target_path} on {args.param1}")
+
+        dele_command = f"DELE {target_path}\r\n"
+        dele_data = ftp_client.send(dele_command.encode())
+        dele_response = ftp_client.recv(1024).decode()
+        print(f"DELE response data is: {dele_response}")
+
+
+    # PASV and LIST:  creating a data channel, then implement the LIST command to test it.
+    # multiple operation -> PASV/operation
+    # PASV\r\n: Ask the FTP server to open a data channel.
+
+    # LIST <path-to-directory>\r\n
+    elif args.operation == 'ls':
+        # data channel
+        data_socket = setup_data_channel(ftp_client)
+        try: 
+            target_path = url_info['path']
+            print(f"Listing files on {args.param1}")
+
+            ls_command = f"LIST {target_path}\r\n"
+            ls_data = ftp_client.send(ls_command.encode())
+            ls_response = ftp_client.recv(1024).decode()
+            print(f"LIST response data is: {ls_response}")
+
+            # read data from the channel
+            list = b"" # bytes reading
+            while True:
+                data = data_socket.recv(1024)
+                list += data
+                print(list.encode())
+        finally:
+            data_socket.close()   # server close for the list
+
+
+    # # STORE, RETR, DELE
+    # # STOR <path-to-file>\r\n
+    # RETR <path-to-file>\r\n: download a file from the FTP server
+    elif args.operation in ['cp', 'mv']:
+        data_socket = setup_data_channel(ftp_client)
+        
+        try: 
+            if upload: # STOR
+                target_path = url_info['path']
+                stor_command = f"STOR {target_path}\r\n"
+                stor_data = ftp_client.send(stor_command.encode())
+                stor_response = ftp_client.recv(1024).decode()
+                print(f"RETR response data is: {stor_response}")
+
+                print(f"local path is: {local_path}")
+                with open(local_path, 'rb') as file:
+                    while True:
+                        data = file.read(8192)
+                        if not data: # empty files
+                            break
+                        data_socket.send(data) # upload
+
+                data_socket.close() # client close for the upload
+
+            else: # RETR
+                target_path = url_info['path']
+                retr_command = f"RETR {target_path}\r\n"
+                retr_data = ftp_client.send(retr_command.encode())
+                retr_response = ftp_client.recv(1024).decode()
+                print(f"RETR response data is: {retr_response}")
+
+                print(f"local path is: {local_path}")
+                with open(local_path, 'wb') as file:
+                    while True:
+                        data = data_socket.recv(8192)
+                        if not data:
+                            break
+                        file.write(data)
+        finally:
+            if data_socket: 
+                data_socket.close() # server close # how to get the server close? 
+
+        # transfer response
+        final_response = ftp_client.recv(1024).decode()
+        print(f"Debug - Final response: {final_response}")
+    
+
+    # Once data channel is closed, client close ftp by sending quit to the server
+    # QUIT: QUIT\r\n
+    quit = "QUIT\r\n"
+    print(f"checking for QUIT: {quit}")
+    ftp_client.send(quit.encode())
+    ftp_client.close() # close the ftp server
+
+
+if __name__ == "__main__":
+    import sys
+    print(f"sys.argv is: {sys.argv[1:]}")
+    main(*sys.argv[1:]) # pass in arguments here
