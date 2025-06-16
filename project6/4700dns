@@ -1,0 +1,292 @@
+#!/usr/bin/env -S python3 -u
+
+import argparse, socket, time, json, select, struct, sys, math
+from dnslib import DNSRecord, DNSHeader, RR, QTYPE, A, ZoneParser, RCODE
+from collections import defaultdict
+import threading
+
+
+class Server:
+    def __init__(self, root_ip, zone_path, port):
+        self.root_ip = root_ip
+        # self.domain = domain
+        self.zone_path = zone_path
+        self.ns_records = []
+        self.root_server_ip = root_ip
+        self.cache = {}
+
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(("0.0.0.0", port))
+        self.port = self.socket.getsockname()[1]
+        self.log("Bound to port %d" % self.port)
+
+        self.record_map = defaultdict(list) # used to extract the qname
+        self.soa_domain = self.parse_zone_file(zone_path) # parse the zone_file
+
+
+    def log(self, message):
+        sys.stderr.write(message + "\n")
+        sys.stderr.flush() 
+
+    def send(self, addr, message):
+        self.log("Sending message:\n%s" % message)
+        self.socket.sendto(message.pack(), addr)
+
+    # forward the query to the root server
+    def forward_to_root(self, query_data):
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(5)  # Timeout after 5 seconds
+            sock.sendto(query_data, (self.root_server_ip, 60053))  # Root server IP given at startup
+            print(f"send to the root server successfully")
+            response_data, _ = sock.recvfrom(65535)
+        return response_data
+
+    # def response_needs_recursion(self, response):
+    #     # Return True only if no useful ANSWER or no IP
+    #     if response.rr:
+    #         return False
+    #     # If additional section has no A records, probably needs recursion
+    #     for rr in response.ar:
+    #         if rr.rtype == QTYPE.A:
+    #             return False
+    #     return len(response.rr) == 0
+
+    def recv(self, socket):
+        data, addr = socket.recvfrom(65535)
+        request = DNSRecord.parse(data)
+        self.log("Received message:\n%s" % request)
+
+        # YOU WILL NEED TO ACTUALLY DO SOMETHING SMART HERE
+        # WE ARE JUST REPLYING WITH A FIXED RESPONSE
+        response = request.reply()
+        qname = str(request.q.qname).rstrip(".")
+        qtype = request.q.qtype # MATCH:request type
+        Found = False 
+
+        # Try cache first
+        cached_response = self.cache_lookup(qname, qtype)
+        if cached_response:
+            self.log("Cache hit for %s" % qname)
+            cached_response.header.id = request.header.id  # Match transaction ID
+            cached_response.header.ra = True
+            self.send(addr, cached_response)
+            return f"Cache served request from {addr} for {qname}"
+
+        if qname in self.record_map:
+            for rr in self.record_map[qname]:
+                if rr.rtype == qtype:   # MATCH:response type
+                    response.add_answer(rr)
+                    Found = True
+            
+            for rr in self.record_map[qname]:  # NEW LOOP
+                if rr.rtype == QTYPE.CNAME:
+                    response.add_answer(rr)
+                    Found = True
+                    cname_target = str(rr.rdata.label).rstrip(".") # after CNAME
+                    if cname_target in self.record_map:
+                        for c_rr in self.record_map[cname_target]:
+                            if c_rr.rtype == qtype:
+                                response.add_answer(c_rr)
+                    
+
+            # level 3 - check for the NS: Add glue A records in ADDITIONAL section
+            if qtype == QTYPE.NS:
+                for rr in self.record_map[qname]: # a;ready in the map
+                    if rr.rtype == QTYPE.NS:
+                        response.add_answer(rr)   
+                        Found = True            
+                        
+                        ns_host = str(rr.rdata.label).rstrip(".")
+                        if ns_host in self.record_map:
+                            for glue_rr in self.record_map[ns_host]:
+                                if glue_rr.rtype == QTYPE.A:
+                                    response.add_ar(glue_rr) # GLUE RECORDS
+    
+
+            # if Found, add to the ns_records
+            if Found and qtype != QTYPE.NS:
+                for ns_rr in self.ns_records:
+                    response.add_auth(ns_rr)
+        
+
+        # level 10 and 11; seems like contracts with the NSDOMAIN case
+        if not Found:
+            response_data = self.forward_to_root(data)
+            response = DNSRecord.parse(response_data)
+            # response = self.bailiwick_check(qname, response)
+
+            # if self.response_needs_recursion(response):
+            if len(response.rr) == 0 and len(response.auth) > 0:
+                print(f"debug ==== checks goes in there or not")
+                # Only if necessary
+                response_data = self.recursive_lookup(data)
+                response = DNSRecord.parse(response_data)
+            
+            # response = self.bailiwick_check(qname, response)
+
+            # NXDOMAIN: queried name not in our zone at all
+            if response.header.rcode == RCODE.NXDOMAIN:
+                response.header.aa = True
+                for rr in self.ns_records:
+                    response.add_auth(rr)
+                
+            else: 
+                response.header.aa = False
+
+            # do cache after recursive and bailiwick
+            if response.header.rcode == RCODE.NOERROR and (response.rr or response.auth or response.ar):
+                self.cache_store(qname, qtype, response)
+        
+        # outside
+        response.header.ra = True # fix the issues for the level-14
+        response.header.tc = 0
+        # response = self.bailiwick_check(qname, response)
+        self.send(addr, response)
+        return f"Processed request from {addr} for {qname}"
+
+    # forward the query to the root server
+    # set port then it could works for both forward-to-root case and the recursive
+    def send_query(self, server_ip, query_data, port=53):
+        attempt = 0
+        while attempt < 5:
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                    sock.settimeout(5)
+                    sock.sendto(query_data, (server_ip, port))
+                    response_data, _ = sock.recvfrom(65535)
+                return response_data
+        
+            except socket.timeout:
+                attempt += 1
+                self.log(f"Timeout, retrying... attempt {attempt}")
+
+    def find_ns_ip(self, response):
+        for rr in response.ar:
+            if rr.rtype == QTYPE.A:
+                return str(rr.rdata)
+        return None
+
+    def find_ns_target(self, response):
+        # Find the NS name from authority section
+        for rr in response.auth:
+            if rr.rtype == QTYPE.NS:
+                return str(rr.rdata.label).rstrip(".")
+        return None
+
+    # def find_glue_ip(self, response, ns_name):
+    #     # Find the matching glue A record in additional section
+    #     for rr in response.ar:
+    #         if rr.rtype == QTYPE.A and str(rr.rname).rstrip(".") == ns_name:
+    #             return str(rr.rdata)
+    #     return None
+
+    # level 12-13
+    # debug for this function
+    def recursive_lookup(self, query_data):
+        server_ip = self.root_server_ip
+        server_port = 60053  # must send to 60053, not default 53
+        qname = DNSRecord.parse(query_data).q.qname
+        while True:
+            response_data = self.send_query(server_ip, query_data)
+            response = DNSRecord.parse(response_data)
+
+            if response.rr:
+                # return response_data
+                response = self.bailiwick_check(str(qname).rstrip("."), response)
+                return response.pack()  # <== return packed filtered data
+
+            # Step 1: Find delegation NS name
+            ns_name = self.find_ns_target(response)
+            # print(f"DEBUG == NS name is: {ns_name}")
+            if not ns_name:
+                return response_data  # No delegation, give up
+            
+            # # Step 3: No glue IP, must resolve NS name
+            # ns_query = DNSRecord.question(ns_name, "A")
+            # ns_response_data = self.recursive_lookup(ns_query.pack())
+            # ns_response = DNSRecord.parse(ns_response_data)
+
+            ns_ip = self.find_ns_ip(response)
+            if ns_ip:
+                server_ip = ns_ip
+            else:
+                return response_data
+
+
+    # level 17/18:
+    def in_bailiwick(self, qname, rrname):
+        return rrname == qname or rrname.endswith("." + qname)
+
+    def bailiwick_check(self, qname, response):
+        response.auth = [rr for rr in response.auth if self.in_bailiwick(qname, str(rr.rname))]
+        response.ar = [rr for rr in response.ar if self.in_bailiwick(qname, str(rr.rname))]
+        # response.rr = [rr for rr in response.rr if self.in_bailiwick(qname, str(rr.rname))]
+        return response
+
+    def cache_store(self, qname, qtype, response):
+        all_rrs = response.rr + response.auth + response.ar
+        if not all_rrs:
+            return
+        min_ttl = min(rr.ttl for rr in all_rrs)
+        expire_time = time.time() + min_ttl
+        self.cache[(str(qname), qtype)] = (response.pack(), expire_time)
+
+    def cache_lookup(self, qname, qtype):
+        key = (str(qname), qtype)
+        if key in self.cache:
+            response_data, expire_time = self.cache[key]
+            if time.time() < expire_time:
+                return DNSRecord.parse(response_data)
+            else:
+                del self.cache[key]
+        return None
+            
+    
+    # updates the self.soa_domain
+    def parse_zone_file(self, path):
+        """parse the zone file to get the Authorative domain as required in the step1"""
+        with open(path, 'r') as f:
+                zone_text = f.read()
+        
+        origin = None
+        soa_domain = None
+        
+        # find the Authorative domain after the $ORIGIN
+        for line in zone_text.splitlines():
+            if line.startswith("$ORIGIN"):
+                origin = line.split()[1]
+                print(f"Authorative domain is: {origin}")
+                break
+
+        # find the Authorative domain before SOA
+        zone_records = list(RR.fromZone(zone_text))
+        for rr in zone_records:
+            # alsp append rr in ths parse_zone_file
+            self.record_map[str(rr.rname).rstrip('.')].append(rr)
+            if rr.rtype == QTYPE.SOA and not soa_domain:
+                soa_domain = str(rr.rname).rstrip('.')
+                self.log(f"SOA: Authoritative for domain: {soa_domain}")
+            
+            if rr.rtype == QTYPE.NS:
+                self.ns_records.append(rr)
+
+
+    def run(self):
+        seq = 0
+        while True:
+            socks = select.select([self.socket], [], [], 0.1)[0]
+            for conn in socks:
+                # reply = self.recv(conn)
+                # if reply: 
+                #     self.log(reply)
+                threading.Thread(target=self.recv, args=(conn,), daemon=True).start()
+
+                
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='send data')
+    parser.add_argument('root_ip', type=str, help="The IP address of the root server")
+    parser.add_argument('zone', type=str, help="The zone file for this server")
+    parser.add_argument('--port', type=int, help="The port this server should bind to", default=0)
+    args = parser.parse_args()
+    sender = Server(args.root_ip, args.zone, args.port)
+    sender.run()
